@@ -108,10 +108,131 @@ function setResponseStatus_(rec, status){
 }
 
 function hasConfirmedElsewhere_(email, excludeSlotId) {
-  const confirmed = getResponses_().filter(r => 
-    String(r.Email).toLowerCase() === email.toLowerCase() && 
-    r.Status === 'confirmed' && 
+  const confirmed = getResponses_().filter(r =>
+    String(r.Email).toLowerCase() === email.toLowerCase() &&
+    r.Status === 'confirmed' &&
     r.SlotID !== excludeSlotId
   );
   return confirmed.length > 0;
+}
+
+/** ========= ログ機能 ========= */
+
+/**
+ * 詳細ログを記録するための関数
+ * @param {string} level - ログレベル (INFO, WARN, ERROR, DEBUG)
+ * @param {string} function_name - 実行中の関数名
+ * @param {string} message - ログメッセージ
+ * @param {Object} data - 追加データ (オプション)
+ */
+function writeLog_(level, function_name, message, data = {}) {
+  try {
+    const timestamp = new Date();
+    const logEntry = {
+      timestamp: timestamp,
+      level: level,
+      function: function_name,
+      message: message,
+      data: JSON.stringify(data),
+      user: Session.getActiveUser().getEmail() || 'unknown'
+    };
+
+    // コンソールログも出力
+    console.log(`[${level}] ${function_name}: ${message}`, data);
+
+    // ログシートに記録
+    const logSheet = ensureLogSheet_();
+    logSheet.appendRow([
+      timestamp,
+      level,
+      function_name,
+      message,
+      JSON.stringify(data),
+      logEntry.user
+    ]);
+
+  } catch (error) {
+    // ログ記録でエラーが発生した場合はコンソールのみに出力
+    console.error('Failed to write log:', error);
+    console.log(`[${level}] ${function_name}: ${message}`, data);
+  }
+}
+
+/**
+ * ログ専用シートを作成・取得
+ */
+function ensureLogSheet_() {
+  const ss = getSS_();
+  let logSheet = ss.getSheetByName('SystemLog');
+
+  if (!logSheet) {
+    logSheet = ss.insertSheet('SystemLog');
+    logSheet.appendRow([
+      'Timestamp', 'Level', 'Function', 'Message', 'Data', 'User'
+    ]);
+
+    // ヘッダーを固定
+    logSheet.setFrozenRows(1);
+
+    // 列幅を調整
+    logSheet.setColumnWidths(1, 6, [150, 80, 150, 300, 200, 150]);
+
+    // ヘッダーの背景色を設定
+    logSheet.getRange(1, 1, 1, 6).setBackground('#f0f0f0').setFontWeight('bold');
+  }
+
+  return logSheet;
+}
+
+/**
+ * エラー情報を詳細に記録
+ * @param {string} function_name - エラーが発生した関数名
+ * @param {Error} error - エラーオブジェクト
+ * @param {Object} context - エラー発生時の文脈情報
+ */
+function logError_(function_name, error, context = {}) {
+  const errorData = {
+    name: error.name,
+    message: error.message,
+    stack: error.stack,
+    context: context
+  };
+
+  writeLog_('ERROR', function_name, `エラーが発生しました: ${error.message}`, errorData);
+}
+
+/**
+ * 関数の開始をログに記録
+ * @param {string} function_name - 関数名
+ * @param {Object} params - 関数のパラメータ
+ */
+function logFunctionStart_(function_name, params = {}) {
+  writeLog_('DEBUG', function_name, '関数開始', { parameters: params });
+}
+
+/**
+ * 関数の終了をログに記録
+ * @param {string} function_name - 関数名
+ * @param {Object} result - 関数の実行結果
+ */
+function logFunctionEnd_(function_name, result = {}) {
+  writeLog_('DEBUG', function_name, '関数終了', { result: result });
+}
+
+/**
+ * ユーザーアクションをログに記録
+ * @param {string} action - アクション名
+ * @param {Object} details - アクションの詳細
+ */
+function logUserAction_(action, details = {}) {
+  writeLog_('INFO', 'USER_ACTION', `ユーザーアクション: ${action}`, details);
+}
+
+/**
+ * バッチ処理の詳細をログに記録
+ * @param {string} step - 処理ステップ
+ * @param {Object} details - 処理の詳細
+ */
+function logBatchProcess_(step, details = {}) {
+  writeLog_('INFO', 'BATCH_PROCESS', `バッチ処理: ${step}`, details);
 }

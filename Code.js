@@ -273,51 +273,164 @@ function getSlots() {
 
 /** ========= 申込処理 ========= */
 function register(name, email, slotIds) {
-  if (!name || !email || !slotIds || !slotIds.length) throw new Error('入力が不足しています。');
-  email = String(email).trim().toLowerCase();
+  // ログ記録: 関数開始
+  logFunctionStart_('register', {
+    name: name,
+    email: email,
+    slotIds: slotIds,
+    slotCount: slotIds ? slotIds.length : 0
+  });
 
-  var lock = LockService.getScriptLock(); 
-  lock.waitLock(30000);
-  
+  // ユーザーアクション記録
+  logUserAction_('申し込み開始', {
+    name: name,
+    email: email,
+    requestedSlots: slotIds
+  });
+
   try {
-    var now=new Date(), ss=getSS_(), respSh=ss.getSheetByName(SHEETS.RESP), slotSh=ss.getSheetByName(SHEETS.SLOTS);
-    var slotsAll = readSheetAsObjects_(slotSh);
-
-    var existing = getResponses_().filter(function(r){ 
-      return String(r.Email).toLowerCase()===email; 
-    });
-    var already = new Set(existing.map(function(r){ return r.SlotID; }));
-
-    var created=[];
-    slotIds.forEach(function(id){
-      if (already.has(id)) return;
-      var slot = slotsAll.find(function(s){ return s.SlotID===id; });
-      if (!slot) return;
-      respSh.appendRow([now, name, email, id, slot.Date, slot.Start, slot.End, 'pending', false, false, false, '']);
-      created.push({slotId:id, date:slot.Date, start:slot.Start, end:slot.End});
-    });
-
-    // 受付メール送信
-    if (created.length){
-      var lines = created.map(function(s){
-        var ds=normDateStr_(s.date), st=normTimeStr_(s.start), en=normTimeStr_(s.end);
-        return '・'+fmtJPDateTime_(ds,st)+' - '+en+'（'+CONFIG.tz+'）';
-      }).join('\n');
-      var subject = renderTemplate_(TEMPLATES.participant.receiptSubject, {});
-      var body = renderTemplate_(TEMPLATES.participant.receiptBody, { name:name, lines:lines, fromName:CONFIG.mailFromName });
-      MailApp.sendEmail(email, subject, body, {name:CONFIG.mailFromName});
+    // 入力値検証
+    if (!name || !email || !slotIds || !slotIds.length) {
+      const error = new Error('入力が不足しています。');
+      logError_('register', error, { name, email, slotIds });
+      throw error;
     }
 
-    // 30秒後にバッチ処理をスケジュール
-    scheduleDelayedBatch_(CONFIG.batchProcessDelaySeconds || 30);
+    email = String(email).trim().toLowerCase();
+    writeLog_('INFO', 'register', '入力値検証完了', {
+      normalizedEmail: email,
+      slotIds: slotIds
+    });
 
-    return { 
-      ok:true, 
-      message:'受付しました。確定の可否はメールでお知らせします。', 
-      created:created.length 
-    };
-    
-  } finally { 
-    lock.releaseLock(); 
+    var lock = LockService.getScriptLock();
+    writeLog_('DEBUG', 'register', 'スクリプトロック取得試行中');
+    lock.waitLock(30000);
+    writeLog_('DEBUG', 'register', 'スクリプトロック取得成功');
+
+    try {
+      var now = new Date();
+      var ss = getSS_();
+      var respSh = ss.getSheetByName(SHEETS.RESP);
+      var slotSh = ss.getSheetByName(SHEETS.SLOTS);
+      var slotsAll = readSheetAsObjects_(slotSh);
+
+      writeLog_('INFO', 'register', 'スプレッドシート情報取得完了', {
+        totalSlots: slotsAll.length,
+        timestamp: now
+      });
+
+      // 既存の申し込み確認
+      var existing = getResponses_().filter(function(r){
+        return String(r.Email).toLowerCase()===email;
+      });
+      var already = new Set(existing.map(function(r){ return r.SlotID; }));
+
+      writeLog_('INFO', 'register', '既存申し込み確認完了', {
+        existingCount: existing.length,
+        existingSlots: Array.from(already)
+      });
+
+      var created = [];
+      var skipped = [];
+
+      slotIds.forEach(function(id) {
+        if (already.has(id)) {
+          skipped.push({ slotId: id, reason: '既に申し込み済み' });
+          return;
+        }
+
+        var slot = slotsAll.find(function(s){ return s.SlotID === id; });
+        if (!slot) {
+          skipped.push({ slotId: id, reason: 'スロットが見つからない' });
+          return;
+        }
+
+        try {
+          respSh.appendRow([now, name, email, id, slot.Date, slot.Start, slot.End, 'pending', false, false, false, '']);
+          created.push({slotId:id, date:slot.Date, start:slot.Start, end:slot.End});
+
+          writeLog_('INFO', 'register', '申し込み記録完了', {
+            slotId: id,
+            date: slot.Date,
+            start: slot.Start,
+            end: slot.End
+          });
+        } catch (error) {
+          logError_('register', error, { slotId: id, slot: slot });
+          skipped.push({ slotId: id, reason: 'データ記録エラー' });
+        }
+      });
+
+      writeLog_('INFO', 'register', '申し込み処理完了', {
+        createdCount: created.length,
+        skippedCount: skipped.length,
+        created: created,
+        skipped: skipped
+      });
+
+      // 受付メール送信
+      if (created.length) {
+        try {
+          var lines = created.map(function(s){
+            var ds=normDateStr_(s.date), st=normTimeStr_(s.start), en=normTimeStr_(s.end);
+            return '・'+fmtJPDateTime_(ds,st)+' - '+en+'（'+CONFIG.tz+'）';
+          }).join('\n');
+
+          var subject = renderTemplate_(TEMPLATES.participant.receiptSubject, {});
+          var body = renderTemplate_(TEMPLATES.participant.receiptBody, {
+            name: name,
+            lines: lines,
+            fromName: CONFIG.mailFromName
+          });
+
+          MailApp.sendEmail(email, subject, body, {name: CONFIG.mailFromName});
+
+          writeLog_('INFO', 'register', '受付メール送信完了', {
+            to: email,
+            subject: subject,
+            createdCount: created.length
+          });
+        } catch (error) {
+          logError_('register', error, { email, created });
+          // メール送信エラーは処理を止めない
+        }
+      }
+
+      // バッチ処理スケジュール
+      try {
+        scheduleDelayedBatch_(CONFIG.batchProcessDelaySeconds || 30);
+        writeLog_('INFO', 'register', 'バッチ処理スケジュール完了', {
+          delaySeconds: CONFIG.batchProcessDelaySeconds || 30
+        });
+      } catch (error) {
+        logError_('register', error, { delaySeconds: CONFIG.batchProcessDelaySeconds });
+      }
+
+      const result = {
+        ok: true,
+        message: '受付しました。確定の可否はメールでお知らせします。',
+        created: created.length
+      };
+
+      logFunctionEnd_('register', result);
+      logUserAction_('申し込み完了', {
+        email: email,
+        createdCount: created.length,
+        result: result
+      });
+
+      return result;
+
+    } finally {
+      lock.releaseLock();
+      writeLog_('DEBUG', 'register', 'スクリプトロック解放完了');
+    }
+  } catch (error) {
+    logError_('register', error, { name, email, slotIds });
+    logUserAction_('申し込みエラー', {
+      email: email,
+      error: error.message
+    });
+    throw error;
   }
 }

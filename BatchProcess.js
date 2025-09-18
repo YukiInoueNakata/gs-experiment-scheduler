@@ -1,5 +1,10 @@
 /** ========= バッチ処理 ========= */
 function scheduleDelayedBatch_(seconds) {
+  logBatchProcess_('バッチ処理スケジュール', {
+    delaySeconds: seconds,
+    scheduledAt: new Date()
+  });
+
   ScriptApp.newTrigger('processPendingBatch_')
     .timeBased()
     .after(seconds * 1000)
@@ -7,70 +12,156 @@ function scheduleDelayedBatch_(seconds) {
 }
 
 function processPendingBatch_() {
+  logBatchProcess_('バッチ処理開始', {
+    startTime: new Date(),
+    user: Session.getActiveUser().getEmail()
+  });
+
   const lock = LockService.getScriptLock();
-  lock.waitLock(30000);
-  
+
   try {
-    // 0. 過去日付のデータを除外（今日以前をすべて除外）
-    archivePastDatePending_();
-    
-    // 1. 過剰登録のクリーンアップ
-    cleanupOverflowedPending_();
-    
-    // 2. 空き枠への追加登録
-    fillRemainingSlots_();
-    
-    // 3. pendingのスロットごとの処理
-    processAllPendingSlots_();
-    
-    // 4. 確定後のデータ整理
-    cleanupAfterConfirmation();
-    
-    // 5. メール送信
-    processMailQueue_();
-    
+    writeLog_('DEBUG', 'processPendingBatch_', 'スクリプトロック取得試行中');
+    lock.waitLock(30000);
+    writeLog_('DEBUG', 'processPendingBatch_', 'スクリプトロック取得成功');
+
+    const startTime = new Date();
+    let stepResults = {};
+
+    try {
+      // 0. 過去日付のデータを除外
+      logBatchProcess_('ステップ0開始', { step: '過去日付データの除外' });
+      const archiveResult = archivePastDatePending_();
+      stepResults.archive = archiveResult;
+      logBatchProcess_('ステップ0完了', { step: '過去日付データの除外', result: archiveResult });
+
+      // 1. 過剰登録のクリーンアップ
+      logBatchProcess_('ステップ1開始', { step: '過剰登録のクリーンアップ' });
+      const cleanupResult = cleanupOverflowedPending_();
+      stepResults.cleanup = cleanupResult;
+      logBatchProcess_('ステップ1完了', { step: '過剰登録のクリーンアップ', result: cleanupResult });
+
+      // 2. 空き枠への追加登録
+      logBatchProcess_('ステップ2開始', { step: '空き枠への追加登録' });
+      const fillResult = fillRemainingSlots_();
+      stepResults.fill = fillResult;
+      logBatchProcess_('ステップ2完了', { step: '空き枠への追加登録', result: fillResult });
+
+      // 3. pendingのスロットごとの処理
+      logBatchProcess_('ステップ3開始', { step: 'pending処理' });
+      const pendingResult = processAllPendingSlots_();
+      stepResults.pending = pendingResult;
+      logBatchProcess_('ステップ3完了', { step: 'pending処理', result: pendingResult });
+
+      // 4. 確定後のデータ整理
+      logBatchProcess_('ステップ4開始', { step: '確定後データ整理' });
+      const afterResult = cleanupAfterConfirmation();
+      stepResults.after = afterResult;
+      logBatchProcess_('ステップ4完了', { step: '確定後データ整理', result: afterResult });
+
+      // 5. メール送信
+      logBatchProcess_('ステップ5開始', { step: 'メール送信' });
+      processMailQueue_();
+      logBatchProcess_('ステップ5完了', { step: 'メール送信' });
+
+      const endTime = new Date();
+      const duration = endTime.getTime() - startTime.getTime();
+
+      logBatchProcess_('バッチ処理完了', {
+        startTime: startTime,
+        endTime: endTime,
+        durationMs: duration,
+        results: stepResults
+      });
+
+    } catch (error) {
+      logError_('processPendingBatch_', error, {
+        stepResults: stepResults,
+        timestamp: new Date()
+      });
+      throw error;
+    }
+
   } finally {
     lock.releaseLock();
+    writeLog_('DEBUG', 'processPendingBatch_', 'スクリプトロック解放完了');
   }
 }
 
 /** ========= 過去日付のpending/waitlistをArchive ========= */
 function archivePastDatePending_() {
+  writeLog_('DEBUG', 'archivePastDatePending_', '過去日付データのアーカイブ処理開始');
+
   // 明日の日付を取得（明日より前 = 今日以前をアーカイブ）
   const tomorrow = new Date();
   tomorrow.setDate(tomorrow.getDate() + 1);
   tomorrow.setHours(0, 0, 0, 0);
   const tomorrowStr = normDateStr_(tomorrow);
-  
+
+  writeLog_('DEBUG', 'archivePastDatePending_', 'アーカイブ対象日付計算完了', {
+    tomorrowStr: tomorrowStr,
+    currentDate: new Date()
+  });
+
   const respSh = getSS_().getSheetByName(SHEETS.RESP);
   const responses = respSh.getDataRange().getValues();
-  
-  if (responses.length <= 1) return;
-  
+
+  if (responses.length <= 1) {
+    writeLog_('INFO', 'archivePastDatePending_', 'アーカイブ対象データなし');
+    return { archivedCount: 0, message: 'データなし' };
+  }
+
   const head = responses[0];
   let archivedCount = 0;
-  
+  let archivedDetails = [];
+
   // 後ろから処理（インデックスのズレを防ぐ）
   for (let i = responses.length - 1; i > 0; i--) {
     const row = responses[i];
     const obj = asObj_(head, row);
-    
-    // 日付を確実に正規化して比較
-    const objDateStr = normDateStr_(obj.Date);
-    
-    // 明日より前（今日以前）の日付のpending/waitlistをArchive
-    // confirmedは除外（過去の確定データは別処理で管理）
-    if (objDateStr < tomorrowStr && (obj.Status === 'pending' || obj.Status === 'waitlist')) {
-      moveToArchive_(obj, 'past-date-pending');
-      respSh.deleteRow(i + 1);
-      archivedCount++;
-      console.log(`過去日付をArchive: ${obj.Name} - ${objDateStr} ${obj.SlotID}`);
+
+    try {
+      // 日付を確実に正規化して比較
+      const objDateStr = normDateStr_(obj.Date);
+
+      // 明日より前（今日以前）の日付のpending/waitlistをArchive
+      // confirmedは除外（過去の確定データは別処理で管理）
+      if (objDateStr < tomorrowStr && (obj.Status === 'pending' || obj.Status === 'waitlist')) {
+        moveToArchive_(obj, 'past-date-pending');
+        respSh.deleteRow(i + 1);
+        archivedCount++;
+
+        const detail = {
+          name: obj.Name,
+          email: obj.Email,
+          date: objDateStr,
+          slotId: obj.SlotID,
+          status: obj.Status
+        };
+        archivedDetails.push(detail);
+
+        writeLog_('DEBUG', 'archivePastDatePending_', '過去日付データをアーカイブ', detail);
+      }
+    } catch (error) {
+      logError_('archivePastDatePending_', error, {
+        rowIndex: i,
+        obj: obj
+      });
     }
   }
-  
+
+  const result = {
+    archivedCount: archivedCount,
+    details: archivedDetails,
+    cutoffDate: tomorrowStr
+  };
+
   if (archivedCount > 0) {
-    console.log(`今日以前のpending/waitlist ${archivedCount}件をArchiveに移動`);
+    writeLog_('INFO', 'archivePastDatePending_', `過去日付データアーカイブ完了`, result);
+  } else {
+    writeLog_('INFO', 'archivePastDatePending_', '過去日付データアーカイブ対象なし');
   }
+
+  return result;
 }
 
 function cleanupOverflowedPending_() {
